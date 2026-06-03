@@ -1,5 +1,5 @@
-streamlit
-databricks-sdk
+streamlit>=1.37.0
+databricks-sdk>=0.20.0
 pandas
 requests
 pyarrow

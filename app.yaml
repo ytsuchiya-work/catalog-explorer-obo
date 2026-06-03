@@ -10,5 +10,3 @@ command:
 env:
   - name: DATABRICKS_HOST
     valueFrom: workspace-url
-  - name: DATABRICKS_TOKEN
-    valueFrom: service-principal-token

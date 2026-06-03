@@ -1,59 +1,169 @@
-import streamlit as st
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.sql import StatementState
-import pandas as pd
+import os
 import time
 import base64
 
+import streamlit as st
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.core import Config
+from databricks.sdk.service.sql import StatementState
+import pandas as pd
+
 st.set_page_config(
-    page_title="Unity Catalog Explorer",
+    page_title="Unity Catalog Explorer (OBO)",
     page_icon="🔍",
     layout="wide"
 )
 
 # ─────────────────────────────────────────────
-# 共通ユーティリティ
+# OBO認証
 # ─────────────────────────────────────────────
 
-@st.cache_resource
-def get_workspace_client():
-    """Databricks WorkspaceClientを初期化"""
+def get_user_token() -> str | None:
+    """X-Forwarded-Access-TokenヘッダーからOBOトークンを取得"""
+    try:
+        return st.context.headers.get("X-Forwarded-Access-Token")
+    except AttributeError:
+        return None
+
+
+def _make_client(token: str | None) -> WorkspaceClient:
+    """指定トークン（またはデフォルト認証）のWorkspaceClientを作成"""
+    host = os.environ.get("DATABRICKS_HOST")
+    if token and host:
+        return WorkspaceClient(config=Config(host=host, token=token))
     return WorkspaceClient()
 
 
-@st.cache_data(ttl=300)
-def get_warehouses():
+def get_workspace_client() -> WorkspaceClient:
+    """OBOトークンでWorkspaceClientを初期化（セッション内でキャッシュ）"""
+    token = get_user_token()
+    token_hash = hash(token or "")
+
+    if st.session_state.get("_wc_hash") != token_hash:
+        st.session_state._workspace_client = _make_client(token)
+        st.session_state._wc_hash = token_hash
+
+    return st.session_state._workspace_client
+
+
+def get_current_user_info() -> dict:
+    """現在のログインユーザー情報を取得（セッション内でキャッシュ）"""
+    wc_hash = st.session_state.get("_wc_hash")
+    if "_user_info" not in st.session_state or st.session_state.get("_user_wc_hash") != wc_hash:
+        try:
+            w = get_workspace_client()
+            me = w.current_user.me()
+            display = getattr(me, "display_name", None) or getattr(me, "user_name", None) or "Unknown"
+            email = getattr(me, "user_name", None) or display
+            st.session_state._user_info = {"display_name": display, "email": email}
+        except Exception:
+            st.session_state._user_info = {"display_name": "Unknown", "email": "Unknown"}
+        st.session_state._user_wc_hash = wc_hash
+    return st.session_state._user_info
+
+
+# ─────────────────────────────────────────────
+# キャッシュ付きデータ取得（トークンでユーザー識別）
+# ─────────────────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_warehouses(user_token: str | None):
     """SQLウェアハウス一覧を取得"""
-    w = get_workspace_client()
+    w = _make_client(user_token)
     warehouses = list(w.warehouses.list())
     return [(wh.id, wh.name) for wh in warehouses]
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_catalogs(user_token: str | None):
+    w = _make_client(user_token)
+    catalogs = list(w.catalogs.list())
+    return [c.name for c in catalogs]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_schemas(user_token: str | None, catalog_name: str):
+    w = _make_client(user_token)
+    schemas = list(w.schemas.list(catalog_name=catalog_name))
+    return [s.name for s in schemas]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_tables(user_token: str | None, catalog_name: str, schema_name: str):
+    w = _make_client(user_token)
+    tables = list(w.tables.list(catalog_name=catalog_name, schema_name=schema_name))
+    return tables
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_table_lineage(user_token: str | None, table_full_name: str):
+    w = _make_client(user_token)
+    endpoint = "/api/2.0/lineage-tracking/table-lineage"
+    payload = {
+        "table_name": table_full_name,
+        "include_entity_lineage": True,
+    }
+
+    def to_full_name(node: dict) -> str | None:
+        ti = (node or {}).get("tableInfo")
+        if not ti or ti.get("table_type") != "TABLE":
+            return None
+        return f"{ti['catalog_name']}.{ti['schema_name']}.{ti['name']}"
+
+    try:
+        resp = w.api_client.do(method="GET", path=endpoint, body=payload)
+        upstream = sorted({to_full_name(n) for n in resp.get("upstreams", []) if to_full_name(n)})
+        downstream = sorted({to_full_name(n) for n in resp.get("downstreams", []) if to_full_name(n)})
+        return {"upstream": upstream, "downstream": downstream, "raw": resp, "endpoint": endpoint, "params": payload}
+    except Exception as e:
+        return {"upstream": [], "downstream": [], "error": str(e), "raw": None, "endpoint": endpoint, "params": payload}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_table_info(user_token: str | None, full_name: str):
+    w = _make_client(user_token)
+    return w.tables.get(full_name=full_name)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_genie_spaces(user_token: str | None):
+    """利用可能なGenieスペース一覧をREST APIで取得"""
+    w = _make_client(user_token)
+    resp = w.api_client.do(method="GET", path="/api/2.0/genie/spaces")
+    spaces = resp.get("spaces", [])
+    return [
+        (s["space_id"], s.get("title", s["space_id"]), s.get("description", ""))
+        for s in spaces
+    ]
+
+
+# ─────────────────────────────────────────────
+# サンプルデータ取得
+# ─────────────────────────────────────────────
+
 def get_sample_data(warehouse_id: str, table_name: str, limit: int = 100, exclude_binary: bool = True):
-    """テーブルのサンプルデータを取得"""
+    """テーブルのサンプルデータをOBOクライアントで取得"""
     from databricks.sdk.service.sql import Disposition, Format
     import requests
     import pyarrow.ipc as ipc
     import io
 
     w = get_workspace_client()
+    token = get_user_token()
 
     parts = table_name.split(".")
     escaped_name = ".".join([f"`{part}`" for part in parts])
 
     if exclude_binary:
-        table_info = w.tables.get(full_name=table_name)
+        table_info = get_table_info(token, table_name)
         if table_info.columns:
-            non_binary_cols = []
-            for col in table_info.columns:
-                col_type = col.type_text.upper() if col.type_text else ""
-                if "BINARY" not in col_type:
-                    non_binary_cols.append(f"`{col.name}`")
-            if non_binary_cols:
-                columns_str = ", ".join(non_binary_cols)
-                query = f"SELECT {columns_str} FROM {escaped_name} LIMIT {limit}"
-            else:
-                query = f"SELECT * FROM {escaped_name} LIMIT {limit}"
+            non_binary_cols = [
+                f"`{col.name}`"
+                for col in table_info.columns
+                if "BINARY" not in (col.type_text or "").upper()
+            ]
+            columns_str = ", ".join(non_binary_cols) if non_binary_cols else "*"
+            query = f"SELECT {columns_str} FROM {escaped_name} LIMIT {limit}"
         else:
             query = f"SELECT * FROM {escaped_name} LIMIT {limit}"
     else:
@@ -80,8 +190,7 @@ def get_sample_data(warehouse_id: str, table_name: str, limit: int = 100, exclud
             response = requests.get(link.external_link)
             if response.status_code == 200:
                 reader = ipc.open_stream(io.BytesIO(response.content))
-                table = reader.read_all()
-                all_tables.append(table)
+                all_tables.append(reader.read_all())
 
         if all_tables:
             import pyarrow as pa
@@ -111,59 +220,8 @@ def get_sample_data(warehouse_id: str, table_name: str, limit: int = 100, exclud
 # ページ1: Unity Catalog テーブル検索
 # ─────────────────────────────────────────────
 
-DEFAULT_CATALOG = "samples"
-DEFAULT_SCHEMA = "nyctaxi"
-
-
-@st.cache_data(ttl=300)
-def get_catalogs():
-    w = get_workspace_client()
-    catalogs = list(w.catalogs.list())
-    return [c.name for c in catalogs]
-
-
-@st.cache_data(ttl=300)
-def get_schemas(catalog_name: str):
-    w = get_workspace_client()
-    schemas = list(w.schemas.list(catalog_name=catalog_name))
-    return [s.name for s in schemas]
-
-
-@st.cache_data(ttl=300)
-def get_tables(catalog_name: str, schema_name: str):
-    w = get_workspace_client()
-    tables = list(w.tables.list(catalog_name=catalog_name, schema_name=schema_name))
-    return tables
-
-
-@st.cache_data(ttl=300)
-def get_table_lineage(table_full_name: str):
-    w = get_workspace_client()
-    endpoint = "/api/2.0/lineage-tracking/table-lineage"
-    payload = {
-        "table_name": table_full_name,
-        "include_entity_lineage": True,
-    }
-
-    def to_full_name(node: dict) -> str | None:
-        ti = (node or {}).get("tableInfo")
-        if not ti or ti.get("table_type") != "TABLE":
-            return None
-        return f"{ti['catalog_name']}.{ti['schema_name']}.{ti['name']}"
-
-    try:
-        resp = w.api_client.do(method="GET", path=endpoint, body=payload)
-        upstream = sorted({to_full_name(n) for n in resp.get("upstreams", []) if to_full_name(n)})
-        downstream = sorted({to_full_name(n) for n in resp.get("downstreams", []) if to_full_name(n)})
-        return {"upstream": upstream, "downstream": downstream, "raw": resp, "endpoint": endpoint, "params": payload}
-    except Exception as e:
-        return {"upstream": [], "downstream": [], "error": str(e), "raw": None, "endpoint": endpoint, "params": payload}
-
-
-@st.cache_data(ttl=60)
-def get_table_info(full_name: str):
-    w = get_workspace_client()
-    return w.tables.get(full_name=full_name)
+DEFAULT_CATALOG = "ytcy_azure_east2classic_stable"
+DEFAULT_SCHEMA = "catalog_app"
 
 
 def search_tables(tables, search_term: str):
@@ -177,11 +235,12 @@ def page_catalog_explorer():
     """ページ1: Unity Catalog テーブル検索"""
     st.title("Unity Catalog テーブル検索")
 
-    # サイドバー: カタログとスキーマの選択
+    token = get_user_token()
+
     with st.sidebar:
         st.header("フィルター設定")
         try:
-            warehouses = get_warehouses()
+            warehouses = get_warehouses(token)
             if warehouses:
                 selected_warehouse = st.selectbox(
                     "SQLウェアハウスを選択",
@@ -197,7 +256,7 @@ def page_catalog_explorer():
 
             st.divider()
 
-            catalogs = get_catalogs()
+            catalogs = get_catalogs(token)
             default_cat_idx = catalogs.index(DEFAULT_CATALOG) if DEFAULT_CATALOG in catalogs else 0
             selected_catalog = st.selectbox(
                 "カタログを選択",
@@ -206,7 +265,7 @@ def page_catalog_explorer():
             )
 
             if selected_catalog:
-                schemas = get_schemas(selected_catalog)
+                schemas = get_schemas(token, selected_catalog)
                 default_schema_idx = schemas.index(DEFAULT_SCHEMA) if DEFAULT_SCHEMA in schemas else 0
                 selected_schema = st.selectbox(
                     "スキーマを選択",
@@ -222,7 +281,6 @@ def page_catalog_explorer():
             selected_schema = None
             warehouse_id = None
 
-    # メインエリア
     if selected_catalog and selected_schema:
         search_term = st.text_input(
             "テーブル名で検索",
@@ -231,21 +289,21 @@ def page_catalog_explorer():
         )
 
         try:
-            tables = get_tables(selected_catalog, selected_schema)
+            tables = get_tables(token, selected_catalog, selected_schema)
             filtered_tables = search_tables(tables, search_term)
 
             st.subheader(f"テーブル一覧 ({len(filtered_tables)}件)")
 
             if filtered_tables:
-                table_data = []
-                for t in filtered_tables:
-                    table_type = t.table_type.value if t.table_type else "UNKNOWN"
-                    table_data.append({
+                table_data = [
+                    {
                         "テーブル名": t.name,
-                        "タイプ": table_type,
+                        "タイプ": t.table_type.value if t.table_type else "UNKNOWN",
                         "コメント": t.comment or "",
                         "フルネーム": t.full_name
-                    })
+                    }
+                    for t in filtered_tables
+                ]
 
                 df = pd.DataFrame(table_data)
 
@@ -265,7 +323,7 @@ def page_catalog_explorer():
                     st.divider()
                     st.subheader(f"テーブル詳細: {selected_table}")
 
-                    table_info = get_table_info(selected_table)
+                    table_info = get_table_info(token, selected_table)
 
                     col1, col2 = st.columns(2)
 
@@ -286,20 +344,20 @@ def page_catalog_explorer():
 
                     if table_info.columns:
                         st.markdown("**カラム一覧**")
-                        columns_data = []
-                        for col in table_info.columns:
-                            columns_data.append({
+                        columns_data = [
+                            {
                                 "カラム名": col.name,
                                 "データ型": col.type_text,
                                 "Nullable": "Yes" if col.nullable else "No",
                                 "コメント": col.comment or ""
-                            })
-                        columns_df = pd.DataFrame(columns_data)
-                        st.dataframe(columns_df, use_container_width=True, hide_index=True)
+                            }
+                            for col in table_info.columns
+                        ]
+                        st.dataframe(pd.DataFrame(columns_data), use_container_width=True, hide_index=True)
 
                     st.divider()
                     st.markdown("**テーブルLineage**")
-                    lineage = get_table_lineage(selected_table)
+                    lineage = get_table_lineage(token, selected_table)
                     if lineage.get("error"):
                         st.error(f"Lineage取得に失敗しました: {lineage['error']}")
                     else:
@@ -307,15 +365,13 @@ def page_catalog_explorer():
                         with col_u:
                             st.markdown("**上流テーブル (Upstream)**")
                             if lineage["upstream"]:
-                                up_df = pd.DataFrame({"テーブル名": lineage["upstream"]})
-                                st.dataframe(up_df, use_container_width=True, hide_index=True)
+                                st.dataframe(pd.DataFrame({"テーブル名": lineage["upstream"]}), use_container_width=True, hide_index=True)
                             else:
                                 st.write("なし")
                         with col_d:
                             st.markdown("**下流テーブル (Downstream)**")
                             if lineage["downstream"]:
-                                down_df = pd.DataFrame({"テーブル名": lineage["downstream"]})
-                                st.dataframe(down_df, use_container_width=True, hide_index=True)
+                                st.dataframe(pd.DataFrame({"テーブル名": lineage["downstream"]}), use_container_width=True, hide_index=True)
                             else:
                                 st.write("なし")
                         if not lineage["upstream"] and not lineage["downstream"]:
@@ -334,7 +390,7 @@ def page_catalog_explorer():
                         if st.button("サンプルデータを取得", type="primary"):
                             with st.spinner("データを取得中..."):
                                 try:
-                                    sample_df = get_sample_data(warehouse_id, selected_table, sample_limit, exclude_binary=True)
+                                    sample_df = get_sample_data(warehouse_id, selected_table, sample_limit)
                                     if not sample_df.empty:
                                         st.dataframe(sample_df, use_container_width=True, hide_index=True)
                                         st.caption(f"{len(sample_df)}行を表示")
@@ -355,26 +411,14 @@ def page_catalog_explorer():
 
 
 # ─────────────────────────────────────────────
-# ページ2: Genie 問い合わせ (全て REST API で統一)
+# ページ2: Genie 問い合わせ
 # ─────────────────────────────────────────────
-
-@st.cache_data(ttl=300)
-def get_genie_spaces():
-    """利用可能なGenieスペース一覧をREST APIで取得"""
-    w = get_workspace_client()
-    resp = w.api_client.do(method="GET", path="/api/2.0/genie/spaces")
-    spaces = resp.get("spaces", [])
-    return [
-        (s["space_id"], s.get("title", s["space_id"]), s.get("description", ""))
-        for s in spaces
-    ]
-
 
 def _poll_genie_message(w, space_id, conversation_id, message_id, initial_msg):
     """メッセージが完了するまでポーリングし、最終的なメッセージdictを返す"""
     terminal_statuses = {"COMPLETED", "FAILED", "CANCELLED"}
     msg = initial_msg
-    for _ in range(120):  # 最大10分
+    for _ in range(120):
         status = msg.get("status", "")
         if status in terminal_statuses:
             break
@@ -388,10 +432,7 @@ def _poll_genie_message(w, space_id, conversation_id, message_id, initial_msg):
 
 
 def query_genie(space_id: str, question: str, conversation_id: str | None = None):
-    """
-    Genieに問い合わせを送信し、完了を待って結果を返す。
-    SDKの互換性問題を避けるため、REST APIで統一。
-    """
+    """GenieにOBOクライアントで問い合わせを送信し、完了を待って結果を返す"""
     w = get_workspace_client()
 
     if conversation_id:
@@ -442,10 +483,7 @@ def query_genie(space_id: str, question: str, conversation_id: str | None = None
 
 
 def get_genie_query_result(space_id: str, conversation_id: str, message_id: str, attachment_id: str | None = None):
-    """
-    Genieの問い合わせ結果（クエリ結果）をDataFrameとして取得する。
-    REST APIで統一。
-    """
+    """GenieのクエリをOBOクライアントで取得しDataFrameとして返す"""
     w = get_workspace_client()
 
     if attachment_id:
@@ -472,17 +510,17 @@ def page_genie():
     """ページ2: Genie 問い合わせ"""
     st.title("Genie 問い合わせ")
 
-    # セッションステートの初期化
+    token = get_user_token()
+
     if "genie_history" not in st.session_state:
         st.session_state.genie_history = []
     if "genie_conversation_id" not in st.session_state:
         st.session_state.genie_conversation_id = None
 
-    # サイドバー: Genieスペース選択
     with st.sidebar:
         st.header("Genie 設定")
         try:
-            spaces = get_genie_spaces()
+            spaces = get_genie_spaces(token)
             if spaces:
                 selected_space = st.selectbox(
                     "Genieスペースを選択",
@@ -511,7 +549,6 @@ def page_genie():
         st.info("サイドバーからGenieスペースを選択してください。")
         return
 
-    # 会話履歴の表示
     for entry in st.session_state.genie_history:
         with st.chat_message("user"):
             st.write(entry["question"])
@@ -530,7 +567,6 @@ def page_genie():
                 elif entry.get("query_result_error"):
                     st.warning(f"クエリ結果の取得に失敗: {entry['query_result_error']}")
 
-    # 入力
     question = st.chat_input("Genieに質問を入力...")
 
     if question:
@@ -568,7 +604,6 @@ def page_genie():
                             with st.expander("生成されたSQL"):
                                 st.code(result["sql_query"], language="sql")
 
-                            # クエリ結果を取得
                             try:
                                 query_df = get_genie_query_result(
                                     space_id=space_id,
@@ -603,21 +638,37 @@ def page_genie():
 
 
 # ─────────────────────────────────────────────
-# ページ切り替え
+# サイドバー共通: ユーザー情報・認証ステータス
 # ─────────────────────────────────────────────
 
-PAGES = {
-    "📊 テーブル検索": page_catalog_explorer,
-    "🤖 Genie 問い合わせ": page_genie,
-}
-
 with st.sidebar:
+    user_info = get_current_user_info()
+    token = get_user_token()
+
+    st.markdown(f"**👤 {user_info['display_name']}**")
+    if user_info["email"] != user_info["display_name"]:
+        st.caption(user_info["email"])
+
+    if token:
+        st.success("🔐 ユーザー認証 (OBO)")
+    else:
+        st.warning("⚠️ ローカル開発モード")
+
     st.divider()
-    selected_page = st.radio("ページ選択", list(PAGES.keys()), key="page_selector")
+    selected_page = st.radio(
+        "ページ選択",
+        ["📊 テーブル検索", "🤖 Genie 問い合わせ"],
+        key="page_selector"
+    )
 
-# 選択されたページを描画
-PAGES[selected_page]()
+# ─────────────────────────────────────────────
+# ページ描画
+# ─────────────────────────────────────────────
 
-# フッター
+if selected_page == "📊 テーブル検索":
+    page_catalog_explorer()
+else:
+    page_genie()
+
 st.divider()
-st.caption("Unity Catalog Explorer - Powered by Databricks Apps")
+st.caption("Unity Catalog Explorer - Powered by Databricks Apps (OBO認証)")
