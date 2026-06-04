@@ -13,6 +13,8 @@ OBO (On-Behalf-Of) 認証では、アプリがサービスプリンシパルで�
 
 仕組み：Databricks Apps プロキシがユーザーのアクセストークンを `X-Forwarded-Access-Token` ヘッダーでアプリに転送し、アプリはそのトークンを使用してDatabricks APIを呼び出します。
 
+> **重要**: OBOトークンはデフォルトでは基本的なスコープのみ持ちます。Unity Catalog・SQL・Genie APIを利用するには、アプリの「ユーザー認証」設定で追加スコープを明示的に設定する必要があります。
+
 ## アーキテクチャ
 
 ```
@@ -57,10 +59,17 @@ Databricks Apps の設定:
    - SQLウェアハウス: 「使用可能」権限を追加
    - UCカタログ: 「使用可能」権限を追加（任意）
    - Genieスペース: 「実行可能」権限を追加
-   - **「ユーザー認証」セクションでOAuthスコープを設定**（`sql` / `genie`）
+   - **「ユーザー認証」セクションで以下のOAuthスコープを追加**:
+     | スコープ | 説明 |
+     |---------|------|
+     | `catalog.catalogs:read` | Unity Catalog内のカタログ一覧を読み取る |
+     | `catalog.schemas:read` | Unity Catalog内のスキーマ一覧を読み取る |
+     | `catalog.tables:read` | Unity Catalog内のテーブル情報を読み取る |
+     | `sql` | SQLの実行とSQL関連リソースの管理 |
+     | `genie` | Databricks Genieへのアクセス |
 4. **コンピュート**: M以上を推奨
 
-> **重要**: サービスプリンシパル方式（旧版）と異なり、OBO方式ではアプリのリソース設定で「ユーザー認証」を有効にする必要があります。
+> **重要**: サービスプリンシパル方式（旧版）と異なり、OBO方式ではアプリのリソース設定で「ユーザー認証」を有効にし、必要なOAuthスコープを追加する必要があります。スコープが不足していると `Provided OAuth token does not have required scopes` エラーが発生します。
 
 ### 4. デプロイ
 
@@ -152,7 +161,38 @@ def get_user_token():
 
 ---
 
-### 2. `@st.cache_resource` でOBOトークンが共有されてしまう
+### 2. OBOトークンのスコープ不足（`Provided OAuth token does not have required scopes`）
+
+**エラー内容:**
+```
+接続エラー: Provided OAuth token does not have required scopes: unity-catalog
+接続エラー: Provided OAuth token does not have required scopes: sql
+```
+
+**原因:** Databricks Apps の `X-Forwarded-Access-Token` はデフォルトスコープのみ持ち、Unity Catalog API や SQL API への呼び出しに必要なスコープが含まれていない。
+
+**解決策:** アプリの「ユーザー認証」設定で必要なOAuthスコープを追加する（`catalog.catalogs:read`、`catalog.schemas:read`、`catalog.tables:read`、`sql`、`genie`）。
+
+---
+
+### 3. Databricks SDK の多重認証エラー（`more than one authorization method configured`）
+
+**エラー内容:**
+```
+validate: more than one authorization method configured: oauth and pat
+```
+
+**原因:** Databricks Apps ランタイムは `DATABRICKS_CLIENT_ID`（M2M OAuth）と `DATABRICKS_TOKEN` を環境変数に注入する。`Config(host=host, token=obo_token)` で OBOトークンを渡しても、SDKが環境変数の `DATABRICKS_CLIENT_ID` も読み込み、PAT + OAuth の2つが「設定済み」と判定されて競合する。
+
+**解決策:** `Config` に `auth_type="pat"` を明示的に渡すことで `Config._validate()` の多重認証チェックをバイパスし、`DefaultCredentials` が PAT のみを使うよう強制する:
+```python
+cfg = Config(host=host, token=obo_token, auth_type="pat")
+return WorkspaceClient(config=cfg)
+```
+
+---
+
+### 4. `@st.cache_resource` でOBOトークンが共有されてしまう
 
 **問題:** 旧実装の `@st.cache_resource` では全ユーザーが同一の `WorkspaceClient` を共有してしまい、OBOが機能しない。
 
@@ -169,7 +209,7 @@ def get_workspace_client():
 
 ---
 
-### 3. `@st.cache_data` が複数ユーザー間でデータを共有してしまう
+### 5. `@st.cache_data` が複数ユーザー間でデータを共有してしまう
 
 **問題:** `@st.cache_data` はグローバルキャッシュであり、ユーザーAのデータがユーザーBに返される可能性がある。
 
@@ -186,7 +226,7 @@ catalogs = get_catalogs(get_user_token())
 
 ---
 
-### 4. OBOトークンが None (ローカル開発時)
+### 6. OBOトークンが None (ローカル開発時)
 
 **問題:** ローカル開発環境では `X-Forwarded-Access-Token` ヘッダーが存在しないため、`get_user_token()` が `None` を返す。
 
@@ -194,7 +234,7 @@ catalogs = get_catalogs(get_user_token())
 
 ---
 
-### 5. app.yaml に `service-principal-token` が残っているとOBO認証が機能しない
+### 7. app.yaml に `service-principal-token` が残っているとOBO認証が機能しない
 
 **問題:** `app.yaml` に `DATABRICKS_TOKEN: service-principal-token` が設定されていると、環境変数 `DATABRICKS_TOKEN` が設定され、意図しないSP認証が有効になる可能性がある。
 
@@ -202,7 +242,7 @@ catalogs = get_catalogs(get_user_token())
 
 ---
 
-### 6. Genieスペースが表示されない
+### 8. Genieスペースが表示されない
 
 **問題:** OBOモードでGenieスペース一覧が空になる。
 
@@ -212,7 +252,7 @@ catalogs = get_catalogs(get_user_token())
 
 ---
 
-### 7. サンプルデータ取得時に権限エラー
+### 9. サンプルデータ取得時に権限エラー
 
 **エラー内容:**
 ```
@@ -225,6 +265,64 @@ catalogs = get_catalogs(get_user_token())
 ```sql
 GRANT SELECT ON TABLE <catalog>.<schema>.<table> TO `<user_or_group>`;
 ```
+
+---
+
+### 10. Lineage API で `unity-catalog` スコープエラー（根本原因と2方式の比較）
+
+**エラー内容:**
+```
+Provided OAuth token does not have required scopes: unity-catalog
+```
+
+**根本原因:**
+
+`/api/2.0/lineage-tracking/table-lineage` REST API は legacy スコープ `unity-catalog` を要求する。
+`catalog.catalogs:read` などの細粒度スコープは `unity-catalog` を **満たさない**（内部的に別のスコープ体系）。
+
+**方式①: Account Admin による恒久対応（REST API を使う場合）**
+
+Apps UI の「ユーザー認証」設定では `unity-catalog` を追加できない場合がある。
+Account レベルの custom OAuth app integration を CLI/SDK/API で更新する必要がある:
+
+```bash
+# account-level CLI で custom OAuth app integration に unity-catalog を追加
+databricks account custom-app-integrations update <integration_id> \
+  --scopes "catalog.catalogs:read,catalog.schemas:read,catalog.tables:read,sql,genie,unity-catalog"
+```
+
+スコープ追加後は Cookie クリアまたはシークレットウィンドウで再アクセスして再同意が必要。
+
+**方式②: system tables を SQL 経由で参照（`unity-catalog` スコープ不要・本アプリの実装）**
+
+REST API を使わず `system.access.table_lineage` を SQL Warehouse 経由で照会することで、`sql` スコープのみで動作する:
+
+```sql
+-- Upstream（このテーブルに書き込んでいるテーブル）
+SELECT DISTINCT source_table_full_name AS tbl
+FROM system.access.table_lineage
+WHERE target_table_full_name = '<catalog>.<schema>.<table>'
+  AND source_table_full_name IS NOT NULL
+ORDER BY tbl LIMIT 100;
+
+-- Downstream（このテーブルからデータを読んでいるテーブル）
+SELECT DISTINCT target_table_full_name AS tbl
+FROM system.access.table_lineage
+WHERE source_table_full_name = '<catalog>.<schema>.<table>'
+  AND target_table_full_name IS NOT NULL
+ORDER BY tbl LIMIT 100;
+```
+
+前提: 管理者が `system.access` スキーマを有効化していること。
+
+**本アプリのUI:**
+
+Lineage セクションに2つのタブを設けて両方式を並べて表示し、スコープ差異を視覚的に確認できるようにしている:
+
+| タブ | 使用API | 必要スコープ | 期待動作 |
+|-----|---------|------------|---------|
+| 🔗 Lineage API (REST) | `/api/2.0/lineage-tracking/table-lineage` | `unity-catalog`（legacy） | スコープ未追加時はエラー表示 |
+| 📊 System Tables (SQL) | `system.access.table_lineage` | `sql` | エラーなく結果を返す |
 
 ---
 

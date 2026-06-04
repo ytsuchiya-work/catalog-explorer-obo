@@ -30,7 +30,11 @@ def _make_client(token: str | None) -> WorkspaceClient:
     """指定トークン（またはデフォルト認証）のWorkspaceClientを作成"""
     host = os.environ.get("DATABRICKS_HOST")
     if token and host:
-        return WorkspaceClient(config=Config(host=host, token=token))
+        # Databricks Apps injects DATABRICKS_CLIENT_ID/SECRET into env for M2M auth.
+        # auth_type="pat" bypasses Config._validate() multi-auth check and forces
+        # DefaultCredentials to use only PAT, avoiding the auth conflict.
+        cfg = Config(host=host, token=token, auth_type="pat")
+        return WorkspaceClient(config=cfg)
     return WorkspaceClient()
 
 
@@ -63,12 +67,15 @@ def get_current_user_info() -> dict:
 
 
 # ─────────────────────────────────────────────
-# キャッシュ付きデータ取得（トークンでユーザー識別）
+# キャッシュ付きデータ取得（OBO認証 = ログインユーザーのトークン）
+# user_token を第一引数にしてユーザーごとに別キャッシュエントリを使用。
+# 必要なOAuthスコープ（アプリのユーザー認証設定で追加）:
+#   catalog.catalogs:read / catalog.schemas:read / catalog.tables:read
+#   sql / genie / unity-catalog（Lineage取得に必要）
 # ─────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_warehouses(user_token: str | None):
-    """SQLウェアハウス一覧を取得"""
     w = _make_client(user_token)
     warehouses = list(w.warehouses.list())
     return [(wh.id, wh.name) for wh in warehouses]
@@ -135,6 +142,81 @@ def get_genie_spaces(user_token: str | None):
         (s["space_id"], s.get("title", s["space_id"]), s.get("description", ""))
         for s in spaces
     ]
+
+
+# ─────────────────────────────────────────────
+# SQL実行ヘルパー（小規模クエリ用）
+# ─────────────────────────────────────────────
+
+def _run_sql(w: WorkspaceClient, warehouse_id: str, query: str) -> pd.DataFrame:
+    """同期SQLを実行してDataFrameを返す（INLINE + JSON_ARRAY）"""
+    from databricks.sdk.service.sql import Disposition, Format as SqlFormat
+
+    statement = w.statement_execution.execute_statement(
+        warehouse_id=warehouse_id,
+        statement=query,
+        wait_timeout="30s",
+        disposition=Disposition.INLINE,
+        format=SqlFormat.JSON_ARRAY,
+    )
+
+    while statement.status.state in [StatementState.PENDING, StatementState.RUNNING]:
+        time.sleep(0.5)
+        statement = w.statement_execution.get_statement(statement.statement_id)
+
+    if statement.status.state != StatementState.SUCCEEDED:
+        error = statement.status.error
+        raise Exception(error.message if error else "Unknown error")
+
+    if statement.result and statement.result.data_array:
+        columns = [col.name for col in statement.manifest.schema.columns]
+        return pd.DataFrame(statement.result.data_array, columns=columns)
+
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_table_lineage_sql(user_token: str | None, table_full_name: str, warehouse_id: str):
+    """system.access.table_lineage をSQL経由で照会してリネージを取得する。
+
+    unity-catalog スコープ不要で sql スコープのみで動作する。
+    前提: system.access スキーマが管理者によって有効化されていること。
+    """
+    w = _make_client(user_token)
+    safe_name = table_full_name.replace("'", "''")
+
+    upstream_sql = f"""SELECT DISTINCT source_table_full_name AS tbl
+FROM system.access.table_lineage
+WHERE target_table_full_name = '{safe_name}'
+  AND source_table_full_name IS NOT NULL
+ORDER BY tbl
+LIMIT 100"""
+
+    downstream_sql = f"""SELECT DISTINCT target_table_full_name AS tbl
+FROM system.access.table_lineage
+WHERE source_table_full_name = '{safe_name}'
+  AND target_table_full_name IS NOT NULL
+ORDER BY tbl
+LIMIT 100"""
+
+    try:
+        up_df = _run_sql(w, warehouse_id, upstream_sql)
+        down_df = _run_sql(w, warehouse_id, downstream_sql)
+        upstream = up_df["tbl"].tolist() if not up_df.empty else []
+        downstream = down_df["tbl"].tolist() if not down_df.empty else []
+        return {
+            "upstream": upstream,
+            "downstream": downstream,
+            "queries": {"upstream": upstream_sql, "downstream": downstream_sql},
+            "error": None,
+        }
+    except Exception as e:
+        return {
+            "upstream": [],
+            "downstream": [],
+            "error": str(e),
+            "queries": {"upstream": upstream_sql, "downstream": downstream_sql},
+        }
 
 
 # ─────────────────────────────────────────────
@@ -357,29 +439,73 @@ def page_catalog_explorer():
 
                     st.divider()
                     st.markdown("**テーブルLineage**")
-                    lineage = get_table_lineage(token, selected_table)
-                    if lineage.get("error"):
-                        st.error(f"Lineage取得に失敗しました: {lineage['error']}")
-                    else:
-                        col_u, col_d = st.columns(2)
-                        with col_u:
-                            st.markdown("**上流テーブル (Upstream)**")
-                            if lineage["upstream"]:
-                                st.dataframe(pd.DataFrame({"テーブル名": lineage["upstream"]}), use_container_width=True, hide_index=True)
+                    lineage_tab1, lineage_tab2 = st.tabs([
+                        "🔗 Lineage API (REST) — unity-catalog スコープ必要",
+                        "📊 System Tables (SQL) — sql スコープのみ",
+                    ])
+
+                    with lineage_tab1:
+                        st.caption(
+                            "REST API `/api/2.0/lineage-tracking/table-lineage` を使用。"
+                            "OBOトークンに `unity-catalog` スコープが必要。"
+                        )
+                        lineage = get_table_lineage(token, selected_table)
+                        if lineage.get("error"):
+                            if "unity-catalog" in lineage["error"]:
+                                st.error("❌ スコープエラー: OBOトークンに `unity-catalog` スコープがありません。")
+                                with st.expander("エラー詳細"):
+                                    st.code(lineage["error"])
+                                st.info(
+                                    "💡 **根本原因**: `catalog.*` の細粒度スコープは legacy の `unity-catalog` スコープを満たしません。"
+                                    "Apps UIの「ユーザー認証」設定では追加できず、Account Admin が"
+                                    " account レベルの custom OAuth app integration を CLI/SDK/API で更新する必要があります。"
+                                )
                             else:
-                                st.write("なし")
-                        with col_d:
-                            st.markdown("**下流テーブル (Downstream)**")
-                            if lineage["downstream"]:
-                                st.dataframe(pd.DataFrame({"テーブル名": lineage["downstream"]}), use_container_width=True, hide_index=True)
+                                st.error(f"Lineage取得に失敗しました: {lineage['error']}")
+                        else:
+                            col_u, col_d = st.columns(2)
+                            with col_u:
+                                st.markdown("**上流テーブル (Upstream)**")
+                                if lineage["upstream"]:
+                                    st.dataframe(pd.DataFrame({"テーブル名": lineage["upstream"]}), use_container_width=True, hide_index=True)
+                                else:
+                                    st.write("なし")
+                            with col_d:
+                                st.markdown("**下流テーブル (Downstream)**")
+                                if lineage["downstream"]:
+                                    st.dataframe(pd.DataFrame({"テーブル名": lineage["downstream"]}), use_container_width=True, hide_index=True)
+                                else:
+                                    st.write("なし")
+
+                    with lineage_tab2:
+                        st.caption(
+                            "`system.access.table_lineage` をSQL経由で照会。"
+                            "`sql` スコープのみで動作（`unity-catalog` 不要）。"
+                            "前提: system.access スキーマが管理者によって有効化されていること。"
+                        )
+                        if warehouse_id:
+                            lineage_sql = get_table_lineage_sql(token, selected_table, warehouse_id)
+                            if lineage_sql.get("error"):
+                                st.error(f"エラー: {lineage_sql['error']}")
                             else:
-                                st.write("なし")
-                        if not lineage["upstream"] and not lineage["downstream"]:
-                            with st.expander("Lineageレスポンスの詳細"):
-                                st.write("- エンドポイント:", lineage.get("endpoint") or "不明")
-                                st.write("- パラメータ:", lineage.get("params") or {})
-                                st.write("- 生レスポンス:")
-                                st.write(lineage.get("raw") or {})
+                                col_u, col_d = st.columns(2)
+                                with col_u:
+                                    st.markdown("**上流テーブル (Upstream)**")
+                                    if lineage_sql["upstream"]:
+                                        st.dataframe(pd.DataFrame({"テーブル名": lineage_sql["upstream"]}), use_container_width=True, hide_index=True)
+                                    else:
+                                        st.write("なし")
+                                with col_d:
+                                    st.markdown("**下流テーブル (Downstream)**")
+                                    if lineage_sql["downstream"]:
+                                        st.dataframe(pd.DataFrame({"テーブル名": lineage_sql["downstream"]}), use_container_width=True, hide_index=True)
+                                    else:
+                                        st.write("なし")
+                            with st.expander("実行クエリ"):
+                                st.code(lineage_sql["queries"]["upstream"], language="sql")
+                                st.code(lineage_sql["queries"]["downstream"], language="sql")
+                        else:
+                            st.warning("SQLウェアハウスをサイドバーで選択してください")
 
                     st.divider()
                     st.markdown("**サンプルデータ**")
