@@ -176,6 +176,131 @@ print("顧客セグメントテーブル作成完了")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 4. 集計テーブル（リネージデモ用）
+# MAGIC
+# MAGIC 上記3テーブルを元に集計・加工したテーブルを作成します。
+# MAGIC `CREATE TABLE AS SELECT` によってリネージが `system.access.table_lineage` に記録されます。
+# MAGIC
+# MAGIC | テーブル名 | ソーステーブル | 内容 |
+# MAGIC |-----------|--------------|------|
+# MAGIC | `monthly_sales_summary` | `sales_transactions` | 月次・地域・チャネル別売上集計 |
+# MAGIC | `product_sales_ranking` | `sales_transactions` + `products` | 製品別売上ランキング |
+# MAGIC | `customer_segment_performance` | `sales_transactions` + `customer_segments` | セグメント別売上パフォーマンス |
+# MAGIC | `channel_category_analysis` | `sales_transactions` + `products` | チャネル×カテゴリ別分析 |
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4-1. 月次売上サマリー
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE OR REPLACE TABLE {CATALOG}.{SCHEMA}.monthly_sales_summary
+COMMENT '月次・地域・チャネル別売上集計 — ソース: sales_transactions'
+AS
+SELECT
+  DATE_FORMAT(sale_date, 'yyyy-MM')  AS year_month,
+  region,
+  channel,
+  COUNT(transaction_id)              AS transaction_count,
+  SUM(quantity)                      AS total_quantity,
+  SUM(amount)                        AS total_revenue,
+  AVG(amount)                        AS avg_transaction_value
+FROM {CATALOG}.{SCHEMA}.sales_transactions
+GROUP BY DATE_FORMAT(sale_date, 'yyyy-MM'), region, channel
+ORDER BY year_month, region, channel
+""")
+
+print("monthly_sales_summary 作成完了")
+display(spark.sql(f"SELECT * FROM {CATALOG}.{SCHEMA}.monthly_sales_summary ORDER BY year_month LIMIT 10"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4-2. 製品別売上ランキング
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE OR REPLACE TABLE {CATALOG}.{SCHEMA}.product_sales_ranking
+COMMENT '製品別累計売上ランキング — ソース: sales_transactions + products'
+AS
+SELECT
+  p.product_id,
+  p.product_name,
+  p.category,
+  p.supplier,
+  COUNT(s.transaction_id)                            AS transaction_count,
+  SUM(s.quantity)                                    AS total_quantity_sold,
+  SUM(s.amount)                                      AS total_revenue,
+  RANK() OVER (ORDER BY SUM(s.amount) DESC)          AS revenue_rank
+FROM {CATALOG}.{SCHEMA}.sales_transactions s
+JOIN {CATALOG}.{SCHEMA}.products p ON s.product_id = p.product_id
+GROUP BY p.product_id, p.product_name, p.category, p.supplier
+ORDER BY revenue_rank
+""")
+
+print("product_sales_ranking 作成完了")
+display(spark.sql(f"SELECT * FROM {CATALOG}.{SCHEMA}.product_sales_ranking ORDER BY revenue_rank LIMIT 10"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4-3. 顧客セグメント別パフォーマンス
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE OR REPLACE TABLE {CATALOG}.{SCHEMA}.customer_segment_performance
+COMMENT 'セグメント×チャネル別売上パフォーマンス — ソース: sales_transactions + customer_segments'
+AS
+SELECT
+  cs.segment,
+  s.channel,
+  COUNT(DISTINCT cs.customer_id)  AS customer_count,
+  COUNT(s.transaction_id)         AS transaction_count,
+  SUM(s.amount)                   AS total_revenue,
+  AVG(s.amount)                   AS avg_order_value
+FROM {CATALOG}.{SCHEMA}.sales_transactions s
+JOIN {CATALOG}.{SCHEMA}.customer_segments cs ON s.region = cs.region
+GROUP BY cs.segment, s.channel
+ORDER BY total_revenue DESC
+""")
+
+print("customer_segment_performance 作成完了")
+display(spark.sql(f"SELECT * FROM {CATALOG}.{SCHEMA}.customer_segment_performance ORDER BY total_revenue DESC"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4-4. チャネル×カテゴリ別分析
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE OR REPLACE TABLE {CATALOG}.{SCHEMA}.channel_category_analysis
+COMMENT 'チャネル×カテゴリ別売上分析 — ソース: sales_transactions + products'
+AS
+SELECT
+  s.channel,
+  p.category,
+  COUNT(s.transaction_id)  AS transaction_count,
+  SUM(s.quantity)          AS total_quantity,
+  SUM(s.amount)            AS total_revenue,
+  AVG(s.unit_price)        AS avg_unit_price
+FROM {CATALOG}.{SCHEMA}.sales_transactions s
+JOIN {CATALOG}.{SCHEMA}.products p ON s.product_id = p.product_id
+GROUP BY s.channel, p.category
+ORDER BY total_revenue DESC
+""")
+
+print("channel_category_analysis 作成完了")
+display(spark.sql(f"SELECT * FROM {CATALOG}.{SCHEMA}.channel_category_analysis ORDER BY total_revenue DESC"))
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 権限付与
 # MAGIC
 # MAGIC アプリのサービスプリンシパル（OBOモードでは不要）およびユーザーへの権限付与例。
@@ -187,11 +312,16 @@ print("顧客セグメントテーブル作成完了")
 # アカウント全ユーザーにBROWSE権限を付与（カタログ・スキーマの一覧表示用）
 spark.sql(f"GRANT BROWSE ON CATALOG {CATALOG} TO `account users`")
 spark.sql(f"GRANT USE SCHEMA ON SCHEMA {CATALOG}.{SCHEMA} TO `account users`")
-spark.sql(f"GRANT SELECT ON TABLE {CATALOG}.{SCHEMA}.products TO `account users`")
-spark.sql(f"GRANT SELECT ON TABLE {CATALOG}.{SCHEMA}.sales_transactions TO `account users`")
-spark.sql(f"GRANT SELECT ON TABLE {CATALOG}.{SCHEMA}.customer_segments TO `account users`")
 
-print("権限付与完了")
+BASE_TABLES = ["products", "sales_transactions", "customer_segments"]
+AGG_TABLES  = ["monthly_sales_summary", "product_sales_ranking",
+               "customer_segment_performance", "channel_category_analysis"]
+
+for tbl in BASE_TABLES + AGG_TABLES:
+    spark.sql(f"GRANT SELECT ON TABLE {CATALOG}.{SCHEMA}.{tbl} TO `account users`")
+    print(f"  SELECT 付与: {tbl}")
+
+print("\n権限付与完了")
 
 # COMMAND ----------
 
@@ -201,16 +331,36 @@ display(spark.sql(f"SHOW TABLES IN {CATALOG}.{SCHEMA}"))
 # COMMAND ----------
 
 # 件数確認
-for tbl in ["products", "sales_transactions", "customer_segments"]:
+for tbl in BASE_TABLES + AGG_TABLES:
     count = spark.sql(f"SELECT COUNT(*) as cnt FROM {CATALOG}.{SCHEMA}.{tbl}").collect()[0]["cnt"]
-    print(f"{tbl}: {count}件")
+    print(f"  {tbl}: {count}件")
 
-print("\nセットアップ完了!")
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 期待されるリネージグラフ
+# MAGIC
+# MAGIC ```
+# MAGIC products ──────────────────┬──→ product_sales_ranking
+# MAGIC                            └──→ channel_category_analysis
+# MAGIC
+# MAGIC sales_transactions ────────┬──→ monthly_sales_summary
+# MAGIC                            ├──→ product_sales_ranking
+# MAGIC                            ├──→ customer_segment_performance
+# MAGIC                            └──→ channel_category_analysis
+# MAGIC
+# MAGIC customer_segments ─────────└──→ customer_segment_performance
+# MAGIC ```
+# MAGIC
+# MAGIC `system.access.table_lineage` に反映されるまで数分かかる場合があります。
+
+# COMMAND ----------
+
+print("セットアップ完了!")
 print(f"\nGenieスペースの作成手順:")
 print(f"1. Databricks UIで「Genie」を開く")
 print(f"2. 「スペースを作成」をクリック")
 print(f"3. テーブルとして以下を追加:")
-print(f"   - {CATALOG}.{SCHEMA}.products")
-print(f"   - {CATALOG}.{SCHEMA}.sales_transactions")
-print(f"   - {CATALOG}.{SCHEMA}.customer_segments")
+for tbl in BASE_TABLES + AGG_TABLES:
+    print(f"   - {CATALOG}.{SCHEMA}.{tbl}")
 print(f"4. Genieスペースを作成したら、アプリから利用可能になります")
