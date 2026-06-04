@@ -282,16 +282,96 @@ Provided OAuth token does not have required scopes: unity-catalog
 
 **方式①: Account Admin による恒久対応（REST API を使う場合）**
 
-Apps UI の「ユーザー認証」設定では `unity-catalog` を追加できない場合がある。
-Account レベルの custom OAuth app integration を CLI/SDK/API で更新する必要がある:
+> **前提**: Account Admin 権限が必要。Databricks CLI の最新バージョンを使用すること。
+
+Apps UI の「ユーザー認証」設定で追加できるスコープは限定的で、legacy スコープ `unity-catalog` は含まれない。
+Account レベルで custom OAuth app integration を直接更新する必要がある。
+
+**手順 1: Account レベルで Databricks CLI にログイン**
+
+Azure の場合、アカウントコンソールURL は `https://accounts.azuredatabricks.net`。
 
 ```bash
-# account-level CLI で custom OAuth app integration に unity-catalog を追加
-databricks account custom-app-integrations update <integration_id> \
-  --scopes "catalog.catalogs:read,catalog.schemas:read,catalog.tables:read,sql,genie,unity-catalog"
+databricks auth login \
+  --host https://accounts.azuredatabricks.net \
+  --account-id <account_id> \
+  --profile <profile_name>
 ```
 
-スコープ追加後は Cookie クリアまたはシークレットウィンドウで再アクセスして再同意が必要。
+**手順 2: アプリに紐づく integration_id を確認**
+
+アプリをデプロイすると、Databricks が自動的に Custom OAuth App Integration を作成する。
+`integration_id` は client_id と同一。Apps UI のアプリ設定画面、または以下のコマンドで確認できる:
+
+```bash
+# アカウント内の全 custom-app-integration を一覧表示
+databricks account custom-app-integrations list --profile <profile_name>
+# アプリ名（例: "catalog-explorer-obo ..."）で該当のものを探す
+```
+
+**手順 3: 現在のスコープを確認**
+
+```bash
+databricks account custom-app-integration get '<integration_id>' --profile <profile_name>
+```
+
+レスポンス例:
+```json
+{
+  "integration_id": "65d90ec2-54ba-4fcb-a85d-eac774235aea",
+  "name": "catalog-explorer-obo ...",
+  "scopes": [
+    "openid", "profile", "email", "offline_access",
+    "catalog.catalogs:read", "catalog.schemas:read", "catalog.tables:read",
+    "sql", "genie"
+  ]
+}
+```
+
+**手順 4: `unity-catalog` を追加して更新**
+
+> **重要**: `--json` の `scopes` リストは既存スコープを全て上書きする。手順 3 で確認した既存スコープを全て含めた上で `unity-catalog` を追加すること。
+
+```bash
+databricks account custom-app-integration update '<integration_id>' \
+  --profile <profile_name> \
+  --json '{
+    "scopes": [
+      "openid", "profile", "email", "offline_access",
+      "catalog.catalogs:read", "catalog.schemas:read", "catalog.tables:read",
+      "sql", "genie",
+      "unity-catalog"
+    ]
+  }'
+```
+
+**手順 5: (任意) 更新を確認**
+
+```bash
+databricks account custom-app-integration get '<integration_id>' --profile <profile_name>
+# scopes に "unity-catalog" が含まれていることを確認
+```
+
+**手順 6: ブラウザのキャッシュをクリアして再認証**
+
+スコープ追加後、既存のブラウザセッションには古いトークンが残るため再認証が必要:
+
+- **シークレットウィンドウ（推奨）**: Cmd+Shift+N でシークレットウィンドウを開き、アプリ URL にアクセス
+- **Cookie の手動削除**: Chrome DevTools (F12) → Application タブ → Cookies → アプリドメインの Cookie を削除
+  - Cookie を削除するとき、アプリのタブ/ウィンドウを全て閉じてから削除すること（キャッシュが生き続けるため）
+
+**補足: ユーザー同意のスキップ（Account Admin が事前に同意する場合）**
+
+Account Admin として全ユーザーの同意を事前に許可することで、ユーザーが初回アクセス時に同意画面を見なくて済む:
+
+```bash
+# user_authorized_scopes を空リストに設定することで全スコープを事前同意
+databricks account custom-app-integration update '<integration_id>' \
+  --profile <profile_name> \
+  --json '{"user_authorized_scopes": [""]}'
+```
+
+設定後は `user_authorized_scopes` フィールドがレスポンスから消え、ユーザーへの同意プロンプトが表示されなくなる。
 
 **方式②: system tables を SQL 経由で参照（`unity-catalog` スコープ不要・本アプリの実装）**
 
